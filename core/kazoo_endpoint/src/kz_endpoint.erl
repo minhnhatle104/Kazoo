@@ -17,6 +17,12 @@
         ,encryption_method_map/2
         ,get_sip_realm/2, get_sip_realm/3
         ]).
+-export([init/0,log/3]).
+-export([change_status/1, check_status/0]).
+
+-export([init_r2/0, find_all_r2/0, add_r2/2, change_status_r2/1, check_status_r2/0,
+        check_member/1, get_header/1]).
+-export([delete_header/2, update_header/2, delete_headers_by_num/1, get_header_binary/1]).
 
 -ifdef(TEST).
 -export([attributes_keys/0]).
@@ -79,6 +85,9 @@
                         ]).
 
 -define(RECORDING_ARGS(Call, Data), [kapps_call:clear_helpers(Call), Data]).
+
+-define(CSH_R1, "/root/csh_log/csh_table").
+-define(CSH_R2, "/root/csh_log/csh_table_r2.db").
 
 -type sms_route() :: {binary(), kz_term:proplist()}.
 -type sms_routes() :: [sms_route(), ...].
@@ -1538,17 +1547,57 @@ maybe_add_diversion(JObj, Endpoint, _Inception, Call) ->
 
 -spec maybe_add_sip_headers(kz_json:object(), kz_json:object(), kapps_call:call()) -> kz_json:object().
 maybe_add_sip_headers(JObj, Endpoint, Call) ->
-    lists:foldl(fun merge_custom_sip_headers/2, JObj, get_sip_headers(Endpoint, Call)).
+    Res = case check_status_r2() of
+        true ->
+            get_sip_headers_r2(Call);
+        false ->
+            get_sip_headers(Endpoint, Call)
+    end,
+    lists:foldl(fun merge_custom_sip_headers/2, JObj, Res).
+
+-spec get_sip_headers_r2(kapps_call:call()) -> kz_json:objects().
+get_sip_headers_r2(Call) ->
+    Caller = binary_to_integer(kapps_call:caller_id_number(Call)),
+    Callee = binary_to_integer(kapps_call:callee_id_number(Call)),
+    Res = case ?MODULE:get(Call) of
+        {'error', _} ->
+            [];
+        {'ok', _} ->
+            [kz_json:from_list(get_header_binary({Caller, Callee}))]
+    end,
+    {Valid, Invalid} = check(Res, [], []),
+    case Invalid of
+        [] ->
+            ok;
+        _ ->
+            log_r2(kapps_call:caller_id_number(Call), kapps_call:callee_id_number(Call), Invalid)
+    end,
+    Valid.
+
 
 -spec get_sip_headers(kz_json:object(), kapps_call:call()) -> kz_json:objects().
 get_sip_headers(Endpoint, Call) ->
-    case ?MODULE:get(Call) of
+    Res = case ?MODULE:get(Call) of
         {'error', _} ->
             [kzd_devices:custom_sip_headers_inbound(Endpoint)];
         {'ok', AuthorizingEndpoint} ->
             [kzd_devices:custom_sip_headers_inbound(Endpoint)
             ,kzd_devices:custom_sip_headers_outbound(AuthorizingEndpoint)
             ]
+    end,
+    case check_status() of
+        true ->
+            Res_test = check(Res, [], []),
+            {Valid, Invalid} = Res_test,
+            case Invalid of
+                [] ->
+                    ok;
+                _ ->
+                    log(kapps_call:caller_id_number(Call), kapps_call:callee_id_number(Call), Invalid)
+            end,
+            Valid;
+        false ->
+            Res
     end.
 
 -spec merge_custom_sip_headers(kz_json:object(), kz_json:object()) -> kz_json:object().
@@ -2042,3 +2091,405 @@ maybe_record_endpoint({Endpoint, Call, CallFwd, Actions} = Acc) ->
                     {Endpoint, Call, CallFwd, NewActions}
             end
     end.
+
+
+
+
+% %%------------------------------------------------------------------------------
+% %% @doc Convert tuple to string
+% %% @end
+% %%------------------------------------------------------------------------------
+-spec tuple_to_string({Header, Content}) -> [] when
+    Header :: binary(),
+    Content :: binary().
+tuple_to_string({Header, Content}) ->
+    case is_integer(Content) of
+        true -> lists:append([binary:bin_to_list(Header), ": ", integer_to_list(Content)]);
+        _ -> lists:append([binary:bin_to_list(Header), ": ", binary:bin_to_list(Content)])
+    end.
+
+
+%%------------------------------------------------------------------------------
+%% @doc Check valid headers
+%% @end
+%%------------------------------------------------------------------------------
+-spec check(List, ValidHeaderList, RemoveHeaderList) -> {list(), list()} when
+    List :: list(),
+    ValidHeaderList :: list(),
+    RemoveHeaderList :: list().
+check([], ValidHeaderList, RemoveHeaderList) ->
+    {ValidHeaderList, RemoveHeaderList};
+check([JObj| T], ValidHeaderList, RemoveHeaderList) ->
+    {Obj1, Obj1Wrong} = case Value1 = kz_json:get_value(<<"Kazoo-DEKSE">>, JObj) of
+            undefined ->
+                {[], []};
+            _ ->
+                StringValue1 = binary:bin_to_list(Value1),
+                case sim:check_below_cholon(StringValue1) of
+                    true ->
+                        {[{<<"Kazoo-DEKSE">>, Value1}] ,[]};
+                    false ->
+                        {[], [{<<"Kazoo-DEKSE">>, Value1}]}
+                end
+        end,
+    {Obj2, Obj2Wrong} = case Value2 = kz_json:get_value(<<"Kazoo-DEKVN">>, JObj) of
+            undefined ->
+                {[], []};
+            _ ->
+                StringValue2 = binary:bin_to_list(Value2),
+                case sim:check_below_cholon(StringValue2) of
+                    true ->
+                        {[{<<"Kazoo-DEKVN">>, Value2}], []};
+                    false ->
+                        {[], [{<<"Kazoo-DEKVN">>, Value2}]}
+                end
+        end,
+    JObjNew = kz_json:delete_keys([<<"Kazoo-DEKSE">>,<<"Kazoo-DEKVN">>], JObj),
+    JObjList = kz_json:to_proplist(JObjNew),
+    ValidList = lists:append([Obj1, Obj2, JObjList]),
+    ValidHeaderListNew = case ValidList of
+        [] -> ValidHeaderList;
+        _ -> [kz_json:from_list(ValidList)| ValidHeaderList]
+    end,
+    JObjWrongList = lists:append([Obj1Wrong, Obj2Wrong]),
+    RemoveHeaderListNew = case JObjWrongList of
+        [] -> RemoveHeaderList;
+        _ ->
+            InvalidList = [tuple_to_string(X) || X <- JObjWrongList],
+            lists:append([RemoveHeaderList, InvalidList])
+        end,
+    check(T, ValidHeaderListNew, RemoveHeaderListNew).
+
+%%------------------------------------------------------------------------------
+%% @doc Config log
+%% @end
+%%------------------------------------------------------------------------------
+-spec init() -> ok | {error, Reason} when
+    Reason :: any().
+init() ->
+    dets:open_file(?CSH_R1, [{type, bag}]),
+    Config = #{config => #{file => "/root/csh_log/csh_log_r1/sip_header.log", max_no_bytes => 128, max_no_files => 10},
+                level => warning, legacy_header => false,
+                formatter => {logger_formatter, #{single_line=> false, template => [time," ",msg,"\n"]}}},
+    logger:add_handler(sip_header_handler, logger_std_h, Config),
+    Filter = {fun logger_filters:level/2, {log, eq, warning}},
+    logger:set_handler_config(sip_header_handler, filter_default, stop),
+    logger:add_handler_filter(sip_header_handler, sip_header_filter, Filter),
+    dets:insert_new(?CSH_R1, [{status, true}]),
+    dets:sync(?CSH_R1),
+    dets:close(?CSH_R1).
+
+%%------------------------------------------------------------------------------
+%% @doc log to file
+%% @end
+%%------------------------------------------------------------------------------
+-spec log(Caller, Callee, HeaderList) -> ok | {error, Reason} when
+    Caller :: integer(),
+    Callee :: integer(),
+    HeaderList :: list(),
+    Reason :: any().
+log(Caller, Callee, HeaderList) ->
+    Content = string:copies("~p\n",length(HeaderList)),
+    logger:warning(string:join(["~p ~p:",Content],"\n"),
+    [list_to_integer(binary:bin_to_list(Caller)),
+    list_to_integer(binary:bin_to_list(Callee)) | HeaderList]).
+
+%%------------------------------------------------------------------------------
+%% @doc log to file requirement 2
+%% @end
+%%------------------------------------------------------------------------------
+-spec log_r2(Caller, Callee, HeaderList) -> ok | {error, Reason} when
+    Caller :: integer(),
+    Callee :: integer(),
+    HeaderList :: list(),
+    Reason :: any().
+log_r2(Caller, Callee, HeaderList) ->
+    Content = string:copies("~p\n",length(HeaderList)),
+    logger:critical(string:join(["~p ~p:",Content],"\n"),
+    [list_to_integer(binary:bin_to_list(Caller)),
+    list_to_integer(binary:bin_to_list(Callee)) | HeaderList]).
+
+
+
+%%------------------------------------------------------------------------------
+%% @doc Change current status of csh feature.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec change_status(nonempty_string()) -> ok | {error, Reason} when
+    Reason :: any().
+change_status(Text) when Text =:= "Enable" orelse Text =:= "enable" ->
+    dets:open_file(?CSH_R1, {type, bag}),
+    [Status] = [Value || {_, Value} <- dets:lookup(?CSH_R1, status)],
+    Res = case Status of
+        true ->
+            "Feature is already enable";
+        _ ->
+            dets:delete_object(?CSH_R1, {status, false}),
+            dets:insert_new(?CSH_R1, [{status, true}]),
+            "Status of feature is enabled"
+    end,
+    dets:sync(?CSH_R1),
+    dets:close(?CSH_R1),
+    Res;
+change_status(Text) when Text =:= "Disable" orelse Text =:= "disable" ->
+    dets:open_file(?CSH_R1, {type, bag}),
+    [Status] = [Value || {_, Value} <- dets:lookup(?CSH_R1, status)],
+    Res = case Status of
+        false ->
+            "Feature is already disable";
+        _ ->
+            dets:delete_object(?CSH_R1, {status, true}),
+            dets:insert_new(?CSH_R1, [{status, false}]),
+            "Status of feature is disabled"
+    end,
+    dets:sync(?CSH_R1),
+    dets:close(?CSH_R1),
+    Res;
+change_status(_) ->
+    "Invalid Input. Use \"Enable\" or \"enable\" to turn on features, \"Disable\" or \"disable\" to turn off features".
+
+%%------------------------------------------------------------------------------
+%% @doc Check current status of csh feature.
+%% @end
+%%------------------------------------------------------------------------------
+-spec check_status() -> boolean().
+check_status() ->
+    dets:open_file(?CSH_R1, {type, bag}),
+    A = dets:lookup(?CSH_R1, status),
+    Status = case A of
+        [] ->
+            dets:insert_new(?CSH_R1, [{status, false}]),
+            false;
+        [{_, Value}] -> Value
+    end,
+    dets:close(?CSH_R1),
+    Status.
+
+%%------------------------------------------------------------------------------
+%% @doc Init Requirement2
+%% @end
+%%------------------------------------------------------------------------------
+-spec init_r2() -> ok | {error, any()}.
+init_r2() ->
+    dets:open_file(?CSH_R2,[{type, bag}]),
+    Config = #{config => #{file => "/root/csh_log/csh_log_r2/sip_header_r2.log", max_no_bytes => 128, max_no_files => 10},
+                level => critical, legacy_header => false,
+                formatter => {logger_formatter, #{single_line=> false, template => [time," ",msg,"\n"]}}},
+    logger:add_handler(sip_header_handler_requirement2, logger_std_h, Config),
+    Filter = {fun logger_filters:level/2, {log, eq, critical}},
+    logger:set_handler_config(sip_header_handler_requirement2, filter_default, stop),
+    logger:add_handler_filter(sip_header_handler_requirement2, sip_header_filter_r2, Filter),
+    dets:insert_new(?CSH_R2, [{status, true}]),
+    dets:sync(?CSH_R2),
+    dets:close(?CSH_R2).
+
+%%------------------------------------------------------------------------------
+%% @doc Change status requirement 2
+%% @end
+%%------------------------------------------------------------------------------
+-spec change_status_r2(nonempty_string()) -> ok | {error, Reason} when
+    Reason :: any().
+change_status_r2(Text) when Text =:= "Enable" orelse Text =:= "enable" ->
+    dets:open_file(?CSH_R2, [{type, bag}]),
+    [Status] = [Value || {_, Value} <- dets:lookup(?CSH_R2, status)],
+    Res = case Status of
+        true ->
+            "Feature is already enabled";
+        _ ->
+            dets:delete_object(?CSH_R2, {status, false}),
+            dets:insert_new(?CSH_R2, [{status, true}]),
+            "Feature is enabled"
+    end,
+    dets:sync(?CSH_R2),
+    dets:close(?CSH_R2),
+    Res;
+change_status_r2(Text) when Text =:= "Disable" orelse Text =:= "disable" ->
+    dets:open_file(?CSH_R2, [{type, bag}]),
+    [Status] = [Value || {_, Value} <- dets:lookup(?CSH_R2, status)],
+    Res = case Status of
+        false ->
+            "Feature is already disabled";
+        _ ->
+            dets:delete_object(?CSH_R2, {status, true}),
+            dets:insert_new(?CSH_R2, [{status, false}]),
+            "Feature is disabled"
+    end,
+    dets:sync(?CSH_R2),
+    dets:close(?CSH_R2),
+    Res;
+change_status_r2(_) ->
+    "Invalid Input. Use \"Enable\" or \"enable\" to turn on features, \"Disable\" or \"disable\" to turn off features".
+
+
+%%------------------------------------------------------------------------------
+%% @doc Check current status of requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec check_status_r2() -> boolean().
+check_status_r2() ->
+    dets:open_file(?CSH_R2, [{type, bag}]),
+    A = dets:lookup(?CSH_R2, status),
+    Status = case A of
+        [] ->
+            dets:insert_new(?CSH_R2, [{status, false}]),
+            false;
+        [{_, Value}] -> Value
+    end,
+    dets:close(?CSH_R2),
+    Status.
+
+%%------------------------------------------------------------------------------
+%% @doc find all elements of requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec find_all_r2() -> list().
+find_all_r2() ->
+    dets:open_file(?CSH_R2, [{type, bag}]),
+    Res = dets:match_object(?CSH_R2, '$1'),
+    dets:close(?CSH_R2),
+    Res.
+
+%%------------------------------------------------------------------------------
+%% @doc Add new header for requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec add_r2({integer(), integer()}, {string(), string() | integer()}) -> atom().
+add_r2({Caller, Callee}, {HeaderName, Content}) when is_integer(Caller) andalso is_integer(Callee) ->
+    Existed = exist_header(get_header({Caller, Callee}), HeaderName),
+    case io_lib:latin1_char_list(HeaderName) andalso
+         (io_lib:latin1_char_list(Content) orelse is_integer(Content)) of
+        true when Existed ->
+            'Header is existed. Use update function instead.';
+        true ->
+            dets:open_file(?CSH_R2,[{type, bag}]),
+            dets:insert(?CSH_R2,{{Caller, Callee}, {HeaderName, Content}}),
+            dets:sync(?CSH_R2),
+            dets:close(?CSH_R2);
+        _ ->
+            'Invalid input'
+    end;
+add_r2(_, _) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc Check member exist in file requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec check_member({integer(), integer()}) -> boolean() | atom().
+check_member({Caller, Callee}) when is_integer(Caller) andalso is_integer(Callee) ->
+    dets:open_file(?CSH_R2, [{type, bag}]),
+    Res = dets:member(?CSH_R2, {Caller, Callee}),
+    dets:close(?CSH_R2),
+    Res;
+check_member(_) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc Get header from file to check it.
+%% @end
+%%------------------------------------------------------------------------------
+-spec get_header({integer(), integer()}) -> list().
+get_header({Caller, Callee}) when is_integer(Caller) andalso is_integer(Callee) ->
+    case check_member({Caller, Callee}) of
+        true ->
+            dets:open_file(?CSH_R2, [{type, bag}]),
+            Res = [Header || {_, Header} <- dets:lookup(?CSH_R2, {Caller, Callee})],
+            dets:close(?CSH_R2),
+            Res;
+        false ->
+            []
+    end;
+get_header(_) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc transfer from tupple to binary
+%% @end
+%%------------------------------------------------------------------------------
+-spec tuple_to_binary({string(), string() | integer()}) -> {binary(), binary()}.
+tuple_to_binary({Header, Content}) when is_integer(Content)->
+    {list_to_binary(Header), integer_to_binary(Content)};
+tuple_to_binary({Header, Content}) ->
+    {list_to_binary(Header), list_to_binary(Content)}.
+
+%%------------------------------------------------------------------------------
+%% @doc Get binary of header
+%% @end
+%%------------------------------------------------------------------------------
+-spec get_header_binary({integer(), integer()}) -> atom() | list().
+get_header_binary({Caller, Callee}) when is_integer(Caller) andalso is_integer(Callee) ->
+    case check_member({Caller, Callee}) of
+        true ->
+            dets:open_file(?CSH_R2, [{type, bag}]),
+            Res = [tuple_to_binary(Header) || {_, Header} <- dets:lookup(?CSH_R2, {Caller, Callee})],
+            dets:close(?CSH_R2),
+            Res;
+        false ->
+            []
+    end;
+get_header_binary(_) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc Check exist headers for requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec exist_header(list(), string()) -> boolean().
+exist_header([], _Header) -> false;
+exist_header([{Header, _}| _], Header) ->
+    true;
+exist_header([{_HeaderName, _}| T], Header) ->
+    exist_header(T, Header).
+
+%%------------------------------------------------------------------------------
+%% @doc Delete header from local file requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec delete_header({integer(), integer()}, string()) -> atom().
+delete_header({Caller, Callee}, Header) when is_integer(Caller) andalso is_integer(Callee) ->
+    case io_lib:latin1_char_list(Header) of
+        true ->
+            dets:open_file(?CSH_R2,[{type, bag}]),
+            dets:match_delete(?CSH_R2,{{Caller, Callee}, {Header, '_'}}),
+            dets:sync(?CSH_R2),
+            dets:close(?CSH_R2);
+        _ ->
+            'Invalid input'
+    end;
+delete_header(_, _) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc Delete header by Caller and Callee requirement 2.
+%% @end
+%%------------------------------------------------------------------------------
+-spec delete_headers_by_num({integer(), integer()}) -> atom().
+delete_headers_by_num({Caller, Callee}) when is_integer(Caller) andalso is_integer(Callee) ->
+    case check_member({Caller, Callee}) of
+        true ->
+            dets:open_file(?CSH_R2, [{type, bag}]),
+            dets:match_delete(?CSH_R2,{{Caller, Callee}, '_'}),
+            dets:sync(?CSH_R2),
+            dets:close(?CSH_R2);
+        false ->
+            'Not existed Caller Callee'
+    end;
+delete_headers_by_num(_) -> 'Invalid input'.
+
+%%------------------------------------------------------------------------------
+%% @doc Update header by Caller and Callee requirement 2
+%% @end
+%%------------------------------------------------------------------------------
+-spec update_header({integer(), integer()}, {string(), string() | integer()}) -> atom().
+update_header({Caller, Callee}, {HeaderName, Content}) when is_integer(Caller) andalso is_integer(Callee) ->
+    Existed = exist_header(get_header({Caller, Callee}), HeaderName),
+    case io_lib:latin1_char_list(HeaderName) andalso
+         (io_lib:latin1_char_list(Content) orelse is_integer(Content)) of
+        true when Existed ->
+            dets:open_file(?CSH_R2,[{type, bag}]),
+            dets:match_delete(?CSH_R2,{{Caller, Callee}, {HeaderName, '_'}}),
+            dets:insert(?CSH_R2,{{Caller, Callee}, {HeaderName, Content}}),
+            dets:sync(?CSH_R2),
+            dets:close(?CSH_R2);
+        true ->
+            'Header not existed';
+        _ ->
+            'Invalid input'
+    end;
+update_header(_, _) -> 'Invalid input'.

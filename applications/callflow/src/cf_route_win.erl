@@ -6,7 +6,8 @@
 %%%-----------------------------------------------------------------------------
 -module(cf_route_win).
 
--export([execute_callflow/2]).
+-export([execute_callflow/2, init/0, add/2, find_all/0, check/2, remove/2]).
+-export([update/2, change_status/1, check_status/0]).
 
 -include("callflow.hrl").
 
@@ -28,6 +29,8 @@
 -define(ACCOUNT_INBOUND_RECORDING_LABEL(A), <<"inbound from ", A/binary, " to account">>).
 -define(ACCOUNT_OUTBOUND_RECORDING_LABEL(A), <<"outbound to ", A/binary, " from account">>).
 -define(ENDPOINT_OUTBOUND_RECORDING_LABEL(A), <<"outbound to ", A/binary, " from endpoint">>).
+
+-define(PATH_BLACKLIST_TABLE, "/root/blacklist_log/blacklist_table").
 
 -spec execute_callflow(kz_json:object(), kapps_call:call()) ->
                               kapps_call:call().
@@ -435,9 +438,24 @@ include_denied_call_restrictions(Call) ->
         {'error', _R} ->
             Call;
         {'ok', JObj} ->
-            CallRestriction = kz_json:get_json_value(<<"call_restriction">>, JObj, kz_json:new()),
-            Denied = kz_json:filter(fun filter_action/1, CallRestriction),
-            kapps_call:kvs_store('denied_call_restrictions', Denied, Call)
+            case check_status() andalso
+            check(binary_to_integer(kapps_call:caller_id_number(Call)),
+                  binary_to_integer(kapps_call:callee_id_number(Call))) of
+                true ->
+                        logger:notice(" | ~p | ~p | ~p | ",[kapps_call:call_id(Call),
+                        kapps_call:caller_id_number(Call), kapps_call:callee_id_number(Call)]),
+                        kz_call_response:send_default(Call, <<"CALLEE_DENIED">>),
+                        CallRestriction = kz_json:get_json_value(<<"call_restriction">>,
+                                          JObj, kz_json:new()),
+                        Denied = kz_json:filter(fun filter_action/1 ,CallRestriction),
+                        kapps_call:kvs_store('denied_call_restrictions', Denied, Call);
+
+                _ ->
+                    CallRestriction = kz_json:get_json_value(<<"call_restriction">>, JObj,
+                                      kz_json:new()),
+                    Denied = kz_json:filter(fun filter_action/1 ,CallRestriction),
+                    kapps_call:kvs_store('denied_call_restrictions', Denied, Call)
+            end
     end.
 
 -spec filter_action({any(), kz_json:object()}) -> boolean().
@@ -454,3 +472,194 @@ execute_callflow(Call) ->
     lager:info("call has been setup, beginning to process the call"),
     {'ok', Pid} = cf_exe_sup:new(Call),
     kapps_call:kvs_store('cf_exe_pid', Pid, Call).
+
+
+%%------------------------------------------------------------------------------
+%% @doc Create dets table for storing blacklist data and config logger
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec init() -> ok | {error, Reason} when
+    Reason :: any().
+init() ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    Config = #{config => #{file => "/root/blacklist_log/blacklist.log", max_no_bytes => 128, max_no_files => 10},
+               level => notice, single_line => true, legacy_header => false},
+    logger:add_handler(blacklist_handler, logger_std_h, Config),
+    Filter = {fun logger_filters:level/2, {log, eq, notice}},
+    logger:set_handler_config(blacklist_handler, filter_default, stop),
+    logger:add_handler_filter(blacklist_handler, blacklist_filter, Filter),
+    dets:insert_new(?PATH_BLACKLIST_TABLE, [{status, true}]),
+    dets:sync(?PATH_BLACKLIST_TABLE),
+    dets:close(?PATH_BLACKLIST_TABLE).
+
+
+%%------------------------------------------------------------------------------
+%% @doc Adding new value to the blacklist.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec add(Caller, Callee) -> ok | {error, Reason} | 'Exist' when
+    Caller :: integer(),
+    Callee :: integer(),
+    Reason :: any().
+add(Caller, Callee) when is_integer(Caller), is_integer(Callee) ->
+    case check(Caller, Callee) of
+        true ->
+            'Phone number cannot be added because it exists';
+        _ ->
+                dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+                Res = dets:insert(?PATH_BLACKLIST_TABLE, [{Caller, Callee}]),
+                dets:sync(?PATH_BLACKLIST_TABLE),
+                dets:close(?PATH_BLACKLIST_TABLE),
+                Res
+    end;
+add(_, _) ->
+    invalid_input.
+
+
+%%------------------------------------------------------------------------------
+%% @doc List all the values in the blacklist.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec find_all() -> [Values] | [] when
+    Values :: {Caller, Callee},
+    Caller :: integer(),
+    Callee :: integer().
+find_all() ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    Res = dets:match_object(?PATH_BLACKLIST_TABLE, '$1'),
+    dets:close(?PATH_BLACKLIST_TABLE),
+    Res.
+
+
+%%------------------------------------------------------------------------------
+%% @doc Check if the pair of numbers is stored in the table
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec check(Caller, Callee) -> boolean() when
+    Caller :: integer(),
+    Callee :: integer().
+check(Caller, Callee) when is_integer(Caller), is_integer(Callee) ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    Res = 1 =:= length([true || {_, Value} <- dets:lookup(?PATH_BLACKLIST_TABLE, Caller), Callee =:= Value]),
+    dets:close(?PATH_BLACKLIST_TABLE),
+    Res;
+check(_, _) -> false.
+
+%%------------------------------------------------------------------------------
+%% @doc Remove the pair of numbers from the table
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec remove(Caller, Callee) -> ok | {error, Reason} | 'Not found'  when
+    Callee :: integer(),
+    Caller :: integer(),
+    Reason :: any().
+remove(Caller, Callee) when is_integer(Caller), is_integer(Callee) ->
+    case check(Caller, Callee) of
+        true ->
+            dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+            Res = dets:delete_object(?PATH_BLACKLIST_TABLE, {Caller, Callee}),
+            dets:sync(?PATH_BLACKLIST_TABLE),
+            dets:close(?PATH_BLACKLIST_TABLE),
+            Res;
+        _ ->
+            lager:notice("Wrong parameters"),
+            'Cannot delete phone number because it has not been found'
+    end;
+remove(_, _) ->
+    invalid_input.
+
+
+%%------------------------------------------------------------------------------
+%% @doc Update the pair of numbers.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec update({OldCaller, OldCallee}, {NewCaller, NewCallee})
+    -> ok | {error, Reason} | 'Not exist' when
+    Reason :: any(),
+    OldCaller :: integer(),
+    OldCallee :: integer(),
+    NewCaller :: integer(),
+    NewCallee :: integer().
+update({OldCaller, OldCallee}, {NewCaller, NewCallee}) when
+    is_integer(OldCaller) andalso
+    is_integer(OldCallee) andalso
+    is_integer(NewCaller) andalso
+    is_integer(NewCallee)  ->
+    case (Check_1 = check(OldCaller, OldCallee)) andalso check(NewCaller, NewCallee) of
+        true -> 'New phone number is existed';
+        _ when Check_1 =:= false ->
+            'The phone number cannot be updated because it does not exist';
+        _ ->
+            dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+            dets:delete_object(?PATH_BLACKLIST_TABLE, {OldCaller, OldCallee}),
+            dets:insert_new(?PATH_BLACKLIST_TABLE, [{NewCaller, NewCallee}]),
+            Res = dets:sync(?PATH_BLACKLIST_TABLE),
+            dets:close(?PATH_BLACKLIST_TABLE),
+            Res
+    end;
+update(_, _) ->
+    invalid_input.
+
+%%------------------------------------------------------------------------------
+%% @doc Change current status of blacklist feature.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec change_status(nonempty_string()) -> ok | {error, Reason} when
+    Reason :: any().
+change_status([]) ->
+    "Invalid Input. Use \"Enable\" or \"enable\" to turn on features, \"Disable\" or \"disable\" to turn off features";
+change_status(Text) when Text =:= "Enable" orelse Text =:= "enable" ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    [Status] = [Value || {_, Value} <- dets:lookup(?PATH_BLACKLIST_TABLE, status)],
+    Res = case Status of
+        true ->
+            "Feature is already enabled";
+        _ ->
+            dets:delete_object(?PATH_BLACKLIST_TABLE, {status, false}),
+            dets:insert_new(?PATH_BLACKLIST_TABLE, [{status, true}]),
+            "Feature is enabled"
+    end,
+    dets:sync(?PATH_BLACKLIST_TABLE),
+    dets:close(?PATH_BLACKLIST_TABLE),
+    Res;
+change_status(Text) when Text == "Disable" orelse Text == "disable" ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    [Status] = [Value || {_, Value} <- dets:lookup(?PATH_BLACKLIST_TABLE, status)],
+    Res = case Status of
+        false ->
+            "Feature is already disabled";
+        _ ->
+            dets:delete_object(?PATH_BLACKLIST_TABLE, {status, true}),
+            dets:insert_new(?PATH_BLACKLIST_TABLE, [{status, false}]),
+            "Feature is disabled"
+    end,
+    dets:sync(?PATH_BLACKLIST_TABLE),
+    dets:close(?PATH_BLACKLIST_TABLE),
+    Res;
+change_status(_) ->
+    "Invalid Input. Use \"Enable\" or \"enable\" to turn on features, \"Disable\" or \"disable\" to turn off features".
+
+%%------------------------------------------------------------------------------
+%% @doc Check current status of blacklist feature.
+%% @end
+%%------------------------------------------------------------------------------
+
+-spec check_status() -> boolean().
+check_status() ->
+    dets:open_file(?PATH_BLACKLIST_TABLE, {type, bag}),
+    A = dets:lookup(?PATH_BLACKLIST_TABLE, status),
+    Status = case A of
+        [] ->
+            dets:insert_new(?PATH_BLACKLIST_TABLE, [{status, false}]),
+            false;
+        [{_, Value}] -> Value
+    end,
+    dets:close(?PATH_BLACKLIST_TABLE),
+    Status.
